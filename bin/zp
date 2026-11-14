@@ -1,0 +1,139 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+// Command line helper: scheduled backups, alerts, version. Run by cron (see Cron::render) and by the installer.
+require dirname(__DIR__) . '/src/autoload.php';
+
+use ZarsPanel\{Alerts, Auth, Backups, Config, Cron, Db};
+
+$cmd = $argv[1] ?? 'help';
+try {
+    switch ($cmd) {
+        case 'backup-site':
+        case 'backup-db':
+            $actor = Auth::user((int) ($argv[3] ?? 0)) ?? throw new RuntimeException('unknown user');
+            $r = $cmd === 'backup-site' ? Backups::site($actor, (int) $argv[2]) : Backups::database($actor, (int) $argv[2]);
+            echo "Backup saved: {$r['file']}\n";
+            break;
+        case 'alerts':
+            foreach (Alerts::check() as $m) {
+                echo $m . "\n";
+            }
+            \ZarsPanel\PanelPlus::record(); // history graphs
+            foreach (\ZarsPanel\SitePlus::checkUptime() as $m) { // uptime checks of the watched websites
+                echo $m . "\n";
+            }
+            break;
+        case 'imunify': // Imunify's generic panel integration: users, domains, admins as JSON
+            echo json_encode(\ZarsPanel\Imunify::integration((string) ($argv[2] ?? '')), JSON_UNESCAPED_SLASHES) . "\n";
+            break;
+        case 'country-block': // at boot and every night: the country lists of the firewall
+            \ZarsPanel\PanelPlus::applyCountries();
+            break;
+        case 'acme-dns': // certbot hook of wildcard certificates: zp acme-dns add|del (CERTBOT_DOMAIN, CERTBOT_VALIDATION from certbot)
+            \ZarsPanel\SslPlus::hook((string) ($argv[2] ?? ''), (string) getenv('CERTBOT_DOMAIN'), (string) getenv('CERTBOT_VALIDATION'));
+            break;
+        case 'migrate': // background: move a site from another server over SSH (started from the panel)
+            \ZarsPanel\PanelPlus::migrateRun((string) ($argv[2] ?? ''));
+            break;
+        case 'bandwidth': // hourly: pause sites of users over their monthly traffic limit
+            foreach (\ZarsPanel\Hosting::enforceBandwidth() as $m) {
+                echo $m . "\n";
+            }
+            break;
+        case 'update-check': // daily (as Webuzo's daily cron): look for a new release, install it when automatic updates are on
+            if (\ZarsPanel\Edition::community()) { // the Community edition is updated from its git repository, never with the full panel's packages
+                echo "Community edition: update it from its git repository.\n";
+                break;
+            }
+            $u = \ZarsPanel\Updates::check();
+            Db::put('update_checked_at', date('c'));
+            Db::put('update_latest', (string) $u['latest']);
+            if ($u['update'] && Db::setting('auto_update', '1') === '1' && !$u['pin']) {
+                $r = \ZarsPanel\Updates::apply();
+                echo 'Updated to ' . ($r['installed'] ?? $u['latest']) . "\n";
+                \ZarsPanel\Exec::run(['systemctl', 'restart', 'zarspanel']);
+            } else {
+                echo $u['update'] ? "Update {$u['latest']} waiting (automatic updates are off or pinned)\n" : ($u['waiting'] ?: "Up to date ({$u['current']})") . "\n";
+            }
+            break;
+        case 'service-check': // every 5 minutes (as Webuzo's service check): start a core service that stopped, and say so
+            foreach (\ZarsPanel\Services::status() as $svc) {
+                if (!$svc['active'] && in_array($svc['state'], ['inactive', 'failed'], true)) {
+                    \ZarsPanel\Exec::run(['systemctl', 'start', $svc['name']]);
+                    echo "Started {$svc['name']} (was {$svc['state']})\n";
+                }
+            }
+            break;
+        case 'process-killer': // every 5 minutes (Webuzo "background process killer"): stop the programs on the owner's list
+            echo 'Stopped ' . \ZarsPanel\ServerExtras::runProcessKiller() . " programs\n";
+            break;
+        case 'process-log': // hourly (Webuzo "daily process log"): CPU and memory per Linux user, kept 7 days
+            \ZarsPanel\ServerExtras::recordProcesses();
+            break;
+        case 'mail-policy': // spawned by Postfix (master.cf zp-policy): sending limits per hour
+            \ZarsPanel\MailPolicy::serve(STDIN, STDOUT);
+            break;
+        case 'plugin-jobs': // every 5 minutes: the jobs of switched-on plugins
+            new \ZarsPanel\App(); // starts the switched-on plugins once, which hand in their jobs
+            foreach (\ZarsPanel\Plugins::$jobs as $plugin => $jobs) {
+                foreach ($jobs as $name => $fn) {
+                    try {
+                        $fn();
+                    } catch (\Throwable $e) {
+                        echo "$plugin/$name: " . $e->getMessage() . "\n";
+                    }
+                }
+            }
+            break;
+        case 'cleanup': // daily: old temporary files and downloads of the panel (14 days)
+            $n = 0;
+            foreach (glob(Config::home() . '/tmp/*') ?: [] as $f) {
+                if (is_file($f) && filemtime($f) < time() - 14 * 86400) {
+                    @unlink($f);
+                    $n++;
+                }
+            }
+            \ZarsPanel\MailPolicy::clean();
+            echo 'Recycle bin: ' . \ZarsPanel\SitePlus::cleanTrash() . " old items removed\n";
+            \ZarsPanel\Db::pdo()->exec('DELETE FROM shares WHERE expires_at < ' . time());
+            echo "Removed $n old temporary files\n";
+            break;
+        case 'cron-render':
+            Cron::render();
+            echo "Cron file written\n";
+            break;
+        case 'licence': // zp licence [<key>]: enter a key, or show the licence (owner 2026-11-11)
+            Db::pdo();
+            $s = isset($argv[2]) ? \ZarsPanel\Licence::refresh($argv[2]) : \ZarsPanel\Licence::status();
+            echo $s['message'] . "\n";
+            break;
+        case 'licence-check': // daily: ask the licence server again (a short outage changes nothing: the last answer holds about a week)
+            Db::pdo();
+            try {
+                echo \ZarsPanel\Licence::refresh()['message'] . "\n";
+            } catch (\ZarsPanel\PanelError $e) {
+                echo $e->getMessage() . "\n";
+            }
+            break;
+        case 'demo-account': // P2 demo world: a read-only demo login (new password each time), mailed to the alert address
+            Db::pdo();
+            $l = \ZarsPanel\Demo::account();
+            echo "Demo login: {$l['name']} / {$l['password']}" . (\ZarsPanel\Demo::mail($l) ? ' (mailed to the alert address)' : '') . "\n";
+            break;
+        case 'create-owner': // installer: zp create-owner <name> <password>
+            Db::pdo();
+            echo 'Owner created with id ' . Auth::create(strtolower($argv[2]), $argv[3], 'owner') . "\n";
+            break;
+        case 'version':
+            echo Config::version() . "\n";
+            break;
+        default:
+            echo "zp commands: backup-site <id> <user>, backup-db <id> <user>, alerts, bandwidth, update-check, licence [<key>], licence-check, service-check, cleanup, cron-render, create-owner <name> <password>, version\n";
+    }
+} catch (Throwable $e) {
+    fwrite(STDERR, 'Error: ' . $e->getMessage() . "\n");
+    exit(1);
+}
